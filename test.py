@@ -1,0 +1,263 @@
+import os
+import asyncio
+import aiohttp
+import aiofiles
+from typing import Union
+from pyrogram import Client, filters, idle
+from pyrogram.types import Message
+from pyrogram.raw.functions.phone import CreateGroupCall
+from pyrogram.errors import FloodWait
+
+from pytgcalls import PyTgCalls, StreamType
+from pytgcalls.exceptions import NoActiveGroupCall, AlreadyJoinedError
+from pytgcalls.types.input_stream import AudioPiped, AudioVideoPiped
+from pytgcalls.types import AudioQuality, VideoQuality
+from pytgcalls.types import Update
+from pytgcalls.types.stream import StreamAudioEnded
+
+from youtubesearchpython.__future__ import VideosSearch
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+
+# ==========================================
+# منطقة الإعدادات (ضع بياناتك هنا)
+# ==========================================
+API_ID = 25761783            # ضع API_ID الخاص بك هنا
+API_HASH = "7770de22ee036afb30a99d449c51f4b8"  # ضع API_HASH الخاص بك هنا
+BOT_TOKEN = "8017670938:AAGURw0_kEKdZ_bYAYKs24RedQsfkve9Aiw"  # ضع توكن البوت هنا
+
+# اسم السورس للكتابة على الصور
+SOURCE_NAME = "Caesar Music"
+# مسار ملف الكوكيز (ضروري للتحميل من يوتيوب)
+COOKIES_FILE = "cookies/cookies2.txt"
+
+# ==========================================
+# تهيئة العملاء (Clients Initialization)
+# ==========================================
+
+app = Client(
+    "music_bot_session",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
+
+call_py = PyTgCalls(app)
+
+# ==========================================
+# متغيرات القوائم والتشغيل
+# ==========================================
+playlist = {}   # قائمة التشغيل: {chat_id: [links]}
+titles = {}     # عناوين الأغاني: {chat_id: [titles]}
+playing_now = {} # ما يتم تشغيله حالياً
+
+# ==========================================
+# دوال المساعدة (Helpers)
+# ==========================================
+
+async def download_yt(link, video=False):
+    """دالة التحميل باستخدام yt-dlp مع الكوكيز"""
+    if not os.path.exists(COOKIES_FILE):
+        print(f"⚠️ تحذير: ملف الكوكيز غير موجود في {COOKIES_FILE}")
+    
+    fmt = "bestvideo+bestaudio/best" if video else "bestaudio"
+    command = [
+        "yt-dlp",
+        "--cookies", COOKIES_FILE,
+        "-g",
+        "-f", fmt,
+        link
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        if stdout:
+            return stdout.decode().strip()
+    except Exception as e:
+        print(f"Download Error: {e}")
+    return None
+
+def changeImageSize(maxWidth, maxHeight, image):
+    widthRatio = maxWidth / image.size[0]
+    heightRatio = maxHeight / image.size[1]
+    newWidth = int(widthRatio * image.size[0])
+    newHeight = int(heightRatio * image.size[1])
+    return image.resize((newWidth, newHeight))
+
+async def gen_thumb(videoid):
+    """توليد صورة مصغرة"""
+    filename = f"photos/{videoid}.jpg"
+    if os.path.isfile(filename):
+        return filename
+
+    url = f"https://www.youtube.com/watch?v={videoid}"
+    try:
+        results = VideosSearch(url, limit=1)
+        res = (await results.next())["result"][0]
+        thumbnail_url = res["thumbnails"][0]["url"].split("?")[0]
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(thumbnail_url) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    with open(f"thumb{videoid}.png", "wb") as f:
+                        f.write(data)
+
+        image = Image.open(f"thumb{videoid}.png")
+        image = changeImageSize(1280, 720, image)
+        
+        # تأثيرات
+        background = image.convert("RGBA").filter(filter=ImageFilter.BoxBlur(5))
+        enhancer = ImageEnhance.Brightness(background)
+        image = enhancer.enhance(0.6)
+        
+        # الكتابة
+        draw = ImageDraw.Draw(image)
+        try:
+            font = ImageFont.truetype("arial.ttf", 60) # تأكد من وجود خط أو استخدم الافتراضي
+        except:
+            font = ImageFont.load_default()
+            
+        draw.text((40, 40), f"{SOURCE_NAME}", fill="white", font=font)
+        
+        if not os.path.exists("photos"):
+            os.mkdir("photos")
+            
+        image.convert("RGB").save(filename)
+        os.remove(f"thumb{videoid}.png")
+        return filename
+    except Exception as e:
+        print(f"Thumb Error: {e}")
+        return None
+
+async def play_next(chat_id):
+    """تشغيل الأغنية التالية في القائمة"""
+    if chat_id in playlist and playlist[chat_id]:
+        link = playlist[chat_id].pop(0)
+        title = titles[chat_id].pop(0)
+        
+        stream = AudioPiped(
+            link,
+            audio_parameters=AudioQuality.STUDIO
+        )
+        try:
+            await call_py.change_stream(chat_id, stream)
+            playing_now[chat_id] = title
+        except Exception as e:
+            print(f"Change Stream Error: {e}")
+    else:
+        try:
+            await call_py.leave_group_call(chat_id)
+            if chat_id in playing_now: del playing_now[chat_id]
+        except: pass
+
+# ==========================================
+# أوامر البوت (Handlers)
+# ==========================================
+
+@app.on_message(filters.command(["شغل", "play"], prefixes=["/", ""]) & filters.group)
+async def play_handler(client, message):
+    chat_id = message.chat.id
+    
+    # 1. الحصول على نص البحث
+    if message.reply_to_message:
+        query = "ملف_مرفق" # منطق الملفات يحتاج تحميل، هنا نركز على اليوتيوب للتبسيط
+        await message.reply("⚠️ يرجى إرسال اسم الأغنية مع الأمر (مثال: شغل فيروز)")
+        return
+    else:
+        try:
+            query = message.text.split(None, 1)[1]
+        except IndexError:
+            return await message.reply("❌ اكتب اسم الأغنية بعد الأمر (مثال: شغل عمرو دياب)")
+
+    msg = await message.reply("🔎 جاري البحث...")
+    
+    # 2. البحث في يوتيوب
+    try:
+        search = VideosSearch(query, limit=1)
+        res = (await search.next())["result"][0]
+        videoid = res["id"]
+        title = res["title"]
+        link = f"https://www.youtube.com/watch?v={videoid}"
+        
+        # 3. استخراج الرابط المباشر
+        stream_link = await download_yt(link, video=False)
+        if not stream_link:
+            return await msg.edit("❌ فشل استخراج الرابط، تأكد من الكوكيز.")
+
+        # 4. توليد الصورة
+        thumb = await gen_thumb(videoid)
+
+        # 5. الانضمام أو الإضافة للقائمة
+        try:
+            # محاولة الانضمام مباشرة
+            stream = AudioPiped(stream_link, audio_parameters=AudioQuality.STUDIO)
+            await call_py.join_group_call(
+                chat_id,
+                stream,
+                stream_type=StreamType().pulse_stream
+            )
+            playing_now[chat_id] = title
+            await msg.delete()
+            if thumb:
+                await message.reply_photo(thumb, caption=f"✅ **تم التشغيل:** {title}")
+            else:
+                await message.reply(f"✅ **تم التشغيل:** {title}")
+                
+        except NoActiveGroupCall:
+            await msg.edit("❌ لا توجد مكالمة نشطة! قم بفتح الكول أولاً.")
+        except AlreadyJoinedError:
+            # إضافة للقائمة
+            playlist.setdefault(chat_id, []).append(stream_link)
+            titles.setdefault(chat_id, []).append(title)
+            pos = len(playlist[chat_id])
+            await msg.delete()
+            await message.reply(f"✅ **تمت الإضافة للقائمة** \n🏷 العنوان: {title}\n🔢 المركز: {pos}")
+            
+    except Exception as e:
+        await msg.edit(f"❌ خطأ: {e}")
+
+@app.on_message(filters.command(["تخطي", "skip"], prefixes=["/", ""]) & filters.group)
+async def skip_handler(client, message):
+    if message.chat.id not in playing_now:
+        return await message.reply("❌ مفيش حاجة شغالة.")
+    await message.reply("⏭ تم التخطي.")
+    await play_next(message.chat.id)
+
+@app.on_message(filters.command(["ايقاف", "انهاء", "stop"], prefixes=["/", ""]) & filters.group)
+async def stop_handler(client, message):
+    chat_id = message.chat.id
+    if chat_id in playlist: playlist[chat_id].clear()
+    if chat_id in titles: titles[chat_id].clear()
+    
+    try:
+        await call_py.leave_group_call(chat_id)
+        await message.reply("✅ تم إنهاء التشغيل.")
+    except:
+        await message.reply("❌ البوت غير موجود في الكول.")
+
+# معالج نهاية الأغنية
+@call_py.on_stream_end()
+async def stream_end_handler(client, update: Update):
+    if isinstance(update, StreamAudioEnded):
+        await play_next(update.chat_id)
+
+# ==========================================
+# تشغيل البوت (Main Loop)
+# ==========================================
+
+async def main():
+    print("🚀 جاري تشغيل البوت...")
+    await app.start()
+    await call_py.start()
+    print(f"✅ تم تشغيل البوت: {app.me.first_name}")
+    await idle()
+    print("🛑 جاري إيقاف البوت...")
+    await call_py.stop()
+    await app.stop()
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
